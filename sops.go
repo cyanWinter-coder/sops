@@ -592,11 +592,19 @@ func (tree Tree) Encrypt(key []byte, cipher Cipher) (string, error) {
 // If decryption is successful, it returns the MAC for the decrypted tree
 // (all values if MACOnlyEncrypted is false, or only over values which end
 // up decrypted if MACOnlyEncrypted is true).
-func (tree Tree) Decrypt(key []byte, cipher Cipher) (string, error) {
+func (tree Tree) Decrypt(key []byte, cipher Cipher) (mac string, err error) {
 	log.Debug("Decrypting tree")
-	audit.SubmitEvent(audit.DecryptEvent{
-		File: tree.FilePath,
-	})
+	auditEvent := audit.NewDecryptEvent(
+		tree.FilePath,
+		keyGroupAuditID(tree.Metadata.KeyGroups),
+		audit.ResultSuccess,
+	)
+	defer func() {
+		if err != nil {
+			auditEvent.Result = audit.ResultFailure
+		}
+		audit.SubmitEvent(auditEvent)
+	}()
 	hash := sha512.New()
 	if tree.Metadata.MACOnlyEncrypted {
 		// We initialize with known set of bytes so that a MAC with this setting
@@ -656,6 +664,28 @@ func (tree Tree) Decrypt(key []byte, cipher Cipher) (string, error) {
 		}
 	}
 	return fmt.Sprintf("%X", hash.Sum(nil)), nil
+}
+
+// keyGroupAuditID returns an opaque stable identifier for the file's key
+// groups. Raw key strings/fingerprints are hashed before they reach audit.
+func keyGroupAuditID(groups []KeyGroup) string {
+	if len(groups) == 0 {
+		return ""
+	}
+	groupIDs := make([]string, 0, len(groups))
+	for _, group := range groups {
+		members := make([]string, 0, len(group))
+		for _, masterKey := range group {
+			if masterKey != nil {
+				members = append(members, masterKey.ToString())
+			}
+		}
+		groupIDs = append(groupIDs, audit.IdentifyKeyGroup(members...))
+	}
+	if len(groupIDs) == 1 {
+		return groupIDs[0]
+	}
+	return audit.IdentifyKeyGroup(groupIDs...)
 }
 
 // GenerateDataKey generates a new random data key and encrypts it with all MasterKeys.

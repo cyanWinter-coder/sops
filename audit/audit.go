@@ -5,9 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/user"
-
-	"github.com/pkg/errors"
+	"sync"
+	"time"
 
 	// empty import as per https://godoc.org/github.com/lib/pq
 	_ "github.com/lib/pq"
@@ -27,8 +26,7 @@ func init() {
 		return
 	}
 	var conf config
-	err = yaml.Unmarshal(confBytes, &conf)
-	if err != nil {
+	if err := yaml.Unmarshal(confBytes, &conf); err != nil {
 		log.WithField("error", err).Panicf("Error unmarshalling config")
 	}
 	// If we are running test, then don't create auditors.
@@ -38,21 +36,34 @@ func init() {
 	if flag.Lookup("test.v") != nil {
 		return
 	}
-	var auditErrors []error
+
+	redactor := NewRedactorFromConfig(RedactionConfig{
+		SensitiveFields:     conf.SensitiveFields,
+		SafeFields:          conf.SafeFields,
+		RedactUnknownFields: conf.RedactUnknownFields,
+	})
+	bufferSize := conf.Buffer.Size
+	if bufferSize <= 0 {
+		bufferSize = DefaultBufferCapacity
+	}
 
 	for _, pgConf := range conf.Backends.Postgres {
 		auditDb, err := NewPostgresAuditor(pgConf.ConnStr)
 		if err != nil {
-			auditErrors = append(auditErrors, errors.Wrap(err, fmt.Sprintf("connectStr: %s, err", pgConf.ConnStr)))
+			// Audit availability must not take down decryption. The pool is
+			// still wrapped below; SaveAuditEvent retries until the remote
+			// database recovers or the bounded buffer fills.
+			log.WithField("error", err).Warn("Audit database ping failed; events will be buffered")
 		}
-		auditors = append(auditors, auditDb)
-	}
-	if len(auditErrors) > 0 {
-		log.Errorf("connecting to audit database, defined in %s", configFile)
-		for _, err := range auditErrors {
-			log.Error(err)
+		if auditDb == nil {
+			continue
 		}
-		log.Fatal("one or more audit backends reported errors, exiting")
+		auditDb.Redactor = redactor
+		if conf.RetentionDays > 0 {
+			auditDb.Retention = time.Duration(conf.RetentionDays) * 24 * time.Hour
+		}
+		buffered := NewBufferedAuditor(auditDb, bufferSize, WithRedactor(redactor))
+		Register(buffered)
 	}
 }
 
@@ -60,6 +71,16 @@ func init() {
 const configFile = "/etc/sops/audit.yaml"
 
 type config struct {
+	// SensitiveFields extends or overrides field classification. Unknown
+	// fields are sensitive unless RedactUnknownFields is explicitly false.
+	SensitiveFields     []string `yaml:"sensitive_fields"`
+	SafeFields          []string `yaml:"safe_fields"`
+	RedactUnknownFields *bool    `yaml:"redact_unknown_fields"`
+	Buffer              struct {
+		Size int `yaml:"size"`
+	} `yaml:"buffer"`
+	RetentionDays int `yaml:"retention_days"`
+
 	Backends struct {
 		Postgres []struct {
 			ConnStr string `yaml:"connection_string"`
@@ -67,18 +88,42 @@ type config struct {
 	} `yaml:"backends"`
 }
 
-var auditors []Auditor
+var (
+	auditors  []Auditor
+	auditorMu sync.RWMutex
+)
 
-// SubmitEvent handles an event for all auditors
+// SubmitEvent handles an event for all auditors. Registered asynchronous
+// auditors are expected to return quickly; the global call itself never
+// retries or performs database I/O.
 func SubmitEvent(event interface{}) {
-	for _, auditor := range auditors {
+	auditorMu.RLock()
+	registered := make([]Auditor, len(auditors))
+	copy(registered, auditors)
+	auditorMu.RUnlock()
+
+	for _, auditor := range registered {
 		auditor.Handle(event)
 	}
 }
 
-// Register registers a new Auditor in the global auditor list
+// Register registers a new Auditor in the global auditor list. The signature
+// is unchanged for compatibility with existing SOPS integrations.
 func Register(auditor Auditor) {
+	if auditor == nil {
+		return
+	}
+	auditorMu.Lock()
+	defer auditorMu.Unlock()
 	auditors = append(auditors, auditor)
+}
+
+// ResetAuditorsForTest removes globally registered auditors. Production code
+// should not call it; it exists because the package-level registry is global.
+func ResetAuditorsForTest() {
+	auditorMu.Lock()
+	defer auditorMu.Unlock()
+	auditors = nil
 }
 
 // Auditor is notified when noteworthy events happen,
@@ -90,34 +135,58 @@ type Auditor interface {
 	Handle(event interface{})
 }
 
-// DecryptEvent contains fields relevant to a decryption event
+// DecryptEvent contains fields relevant to a decryption event. The added
+// fields are optional so existing composite literals remain valid.
 type DecryptEvent struct {
-	File string
+	ID         string
+	File       string
+	Timestamp  time.Time
+	KeyGroupID string
+	Result     string
+	Username   string
+	Details    map[string]any
+	Fields     map[string]any
 }
 
-// EncryptEvent contains fields relevant to an encryption event
+// EncryptEvent contains fields relevant to an encryption event.
 type EncryptEvent struct {
-	File string
+	ID         string
+	File       string
+	Timestamp  time.Time
+	KeyGroupID string
+	Result     string
+	Username   string
+	Details    map[string]any
+	Fields     map[string]any
 }
 
-// RotateEvent contains fields relevant to a key rotation event
+// RotateEvent contains fields relevant to a key rotation event.
 type RotateEvent struct {
-	File string
+	ID         string
+	File       string
+	Timestamp  time.Time
+	KeyGroupID string
+	Result     string
+	Username   string
+	Details    map[string]any
+	Fields     map[string]any
 }
 
 // PostgresAuditor is a Postgres SQL DB implementation of the Auditor interface.
-// It persists the audit event by writing a row to the 'audit_event' table.
-// Errors with writing to the database will output a log message and the
-// process will exit with status set to 1
+// It persists safe, redacted events to the audit_event table. Temporary
+// database errors are returned from SaveAuditEvent so the bounded buffer can
+// retry; Handle logs them instead of terminating the SOPS process.
 type PostgresAuditor struct {
-	DB *sql.DB
+	DB        *sql.DB
+	Redactor  *Redactor
+	Retention time.Duration
 }
 
 // NewPostgresAuditor is the constructor for a new PostgresAuditor struct
-// initialized with the given db connection string
+// initialized with the given db connection string.
 func NewPostgresAuditor(connStr string) (*PostgresAuditor, error) {
 	db, err := sql.Open("postgres", connStr)
-	pg := &PostgresAuditor{DB: db}
+	pg := &PostgresAuditor{DB: db, Redactor: DefaultRedactor()}
 	if err != nil {
 		return pg, err
 	}
@@ -129,42 +198,4 @@ func NewPostgresAuditor(connStr string) (*PostgresAuditor, error) {
 		return pg, fmt.Errorf("Database malfunction: SELECT 1 should return 1, but returned %d", result)
 	}
 	return pg, nil
-}
-
-// Handle persists the audit event by writing a row to the
-// 'audit_event' postgres table
-func (p *PostgresAuditor) Handle(event interface{}) {
-	u, err := user.Current()
-	if err != nil {
-		log.Fatalf("Error getting current user for auditing: %s", err)
-	}
-	switch event := event.(type) {
-	case DecryptEvent:
-		// Save the event to the database
-		log.WithField("file", event.File).
-			Debug("Saving decrypt event to database")
-		_, err = p.DB.Exec("INSERT INTO audit_event (action, username, file) VALUES ($1, $2, $3)", "decrypt", u.Username, event.File)
-		if err != nil {
-			log.Fatalf("Failed to insert audit record: %s", err)
-		}
-	case EncryptEvent:
-		// Save the event to the database
-		log.WithField("file", event.File).
-			Debug("Saving encrypt event to database")
-		_, err = p.DB.Exec("INSERT INTO audit_event (action, username, file) VALUES ($1, $2, $3)", "encrypt", u.Username, event.File)
-		if err != nil {
-			log.Fatalf("Failed to insert audit record: %s", err)
-		}
-	case RotateEvent:
-		// Save the event to the database
-		log.WithField("file", event.File).
-			Debug("Saving rotate event to database")
-		_, err = p.DB.Exec("INSERT INTO audit_event (action, username, file) VALUES ($1, $2, $3)", "rotate", u.Username, event.File)
-		if err != nil {
-			log.Fatalf("Failed to insert audit record: %s", err)
-		}
-	default:
-		log.WithField("type", fmt.Sprintf("%T", event)).
-			Info("Received unknown event")
-	}
 }
