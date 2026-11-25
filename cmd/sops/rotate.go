@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"fmt"
 
 	"github.com/getsops/sops/v3"
@@ -17,6 +18,7 @@ type rotateOpts struct {
 	OutputStore      sops.Store
 	InputPath        string
 	IgnoreMAC        bool
+	RotateDataKey    bool
 	AddMasterKeys    []keys.MasterKey
 	RemoveMasterKeys []keys.MasterKey
 	KeyServices      []keyservice.KeyServiceClient
@@ -40,7 +42,7 @@ func rotate(opts rotateOpts) ([]byte, error) {
 		File: tree.FilePath,
 	})
 
-	_, err = common.DecryptTree(common.DecryptTreeOpts{
+	dataKey, err := common.DecryptTree(common.DecryptTreeOpts{
 		Cipher:          opts.Cipher,
 		IgnoreMac:       opts.IgnoreMAC,
 		Tree:            tree,
@@ -51,29 +53,46 @@ func rotate(opts rotateOpts) ([]byte, error) {
 		return nil, err
 	}
 
-	// Add new master keys
-	for _, key := range opts.AddMasterKeys {
-		tree.Metadata.KeyGroups[0] = append(tree.Metadata.KeyGroups[0], key)
-	}
-	// Remove master keys
-	for _, rmKey := range opts.RemoveMasterKeys {
-		for i := range tree.Metadata.KeyGroups {
-			for j, groupKey := range tree.Metadata.KeyGroups[i] {
-				if rmKey.ToString() == groupKey.ToString() {
-					tree.Metadata.KeyGroups[i] = append(tree.Metadata.KeyGroups[i][:j], tree.Metadata.KeyGroups[i][j+1:]...)
-				}
-			}
+	if opts.RotateDataKey {
+		// Rotate the data key itself, not just the master keys wrapping
+		// it. Every remaining master key will have to encrypt the fresh
+		// data key, and the payload is re-encrypted below.
+		dataKey = make([]byte, 32)
+		if _, err := rand.Read(dataKey); err != nil {
+			return nil, fmt.Errorf("could not generate a new data key: %s", err)
 		}
 	}
 
-	// Create a new data key
-	dataKey, errs := tree.GenerateDataKeyWithKeyServices(opts.KeyServices)
-	if len(errs) > 0 {
-		err = fmt.Errorf("Could not generate data key: %s", errs)
-		return nil, err
+	// Re-wrap the data key with the new set of master keys. This is
+	// resumable: it only mutates the in-memory metadata, processes the
+	// key groups one by one, and verifies that the remaining keys can
+	// recover the data key before reporting success.
+	report := tree.Metadata.RotateKeys(dataKey, sops.RotateKeysOpts{
+		Add:             opts.AddMasterKeys,
+		Remove:          opts.RemoveMasterKeys,
+		KeyServices:     opts.KeyServices,
+		DecryptionOrder: opts.DecryptionOrder,
+		ReencryptAll:    opts.RotateDataKey,
+	})
+	for _, id := range report.AddedKeys {
+		log.WithField("key", id).Info("Added master key")
+	}
+	for _, id := range report.SkippedKeys {
+		log.WithField("key", id).Info("Master key already present, skipping")
+	}
+	for _, id := range report.RemovedKeys {
+		log.WithField("key", id).Info("Removed master key")
+	}
+	if !report.OK() {
+		// The original file is left untouched and remains decryptable
+		// with the original keys. Re-running the same command resumes
+		// the rotation: keys that were already rotated are skipped.
+		return nil, common.NewExitError(report.Error(), codes.KeysRotationFailed)
 	}
 
-	// Reencrypt the file with the new key
+	// Re-encrypt the payload. With the default data-key-preserving
+	// rotation this only re-encrypts locally with the same data key and
+	// refreshes the MAC; no key service is involved.
 	err = common.EncryptTree(common.EncryptTreeOpts{
 		DataKey: dataKey, Tree: tree, Cipher: opts.Cipher,
 	})

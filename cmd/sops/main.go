@@ -1112,12 +1112,16 @@ func main() {
 		},
 		{
 			Name:      "rotate",
-			Usage:     "generate a new data encryption key and reencrypt all values with the new key",
+			Usage:     "rotate the master keys of a file, keeping the data encryption key unless --rotate-data-key is given",
 			ArgsUsage: `file`,
 			Flags: append([]cli.Flag{
 				cli.BoolFlag{
 					Name:  "in-place, i",
 					Usage: "write output back to the same file instead of stdout",
+				},
+				cli.BoolFlag{
+					Name:  "rotate-data-key",
+					Usage: "also generate a new data encryption key and reencrypt all values with it, instead of only re-wrapping the existing data key with the new master keys",
 				},
 				cli.StringFlag{
 					Name:  "output",
@@ -1256,17 +1260,12 @@ func main() {
 					return toExitError(err)
 				}
 
-				// We open the file *after* the operations on the tree have been
-				// executed to avoid truncating it when there's errors
+				// The file is replaced atomically and only after the
+				// rotation fully succeeded, so a failure can never leave
+				// a half-rotated, undecryptable file behind.
 				if c.Bool("in-place") {
-					file, err := os.Create(fileName)
-					if err != nil {
-						return common.NewExitError(fmt.Sprintf("Could not open in-place file for writing: %s", err), codes.CouldNotWriteOutputFile)
-					}
-					defer file.Close()
-					_, err = file.Write(output)
-					if err != nil {
-						return toExitError(err)
+					if err := common.WriteFileAtomic(fileName, output); err != nil {
+						return common.NewExitError(fmt.Sprintf("Could not write in-place file: %s", err), codes.CouldNotWriteOutputFile)
 					}
 					log.Info("File written successfully")
 					return nil
@@ -1274,12 +1273,10 @@ func main() {
 
 				outputFile := os.Stdout
 				if c.String("output") != "" {
-					file, err := os.Create(c.String("output"))
-					if err != nil {
-						return common.NewExitError(fmt.Sprintf("Could not open output file for writing: %s", err), codes.CouldNotWriteOutputFile)
+					if err := common.WriteFileAtomic(c.String("output"), output); err != nil {
+						return common.NewExitError(fmt.Sprintf("Could not write output file: %s", err), codes.CouldNotWriteOutputFile)
 					}
-					defer file.Close()
-					outputFile = file
+					return nil
 				}
 				_, err = outputFile.Write(output)
 				return toExitError(err)
@@ -1692,7 +1689,11 @@ func main() {
 		},
 		cli.BoolFlag{
 			Name:  "rotate, r",
-			Usage: "generate a new data encryption key and reencrypt all values with the new key",
+			Usage: "rotate the master keys of a file, keeping the data encryption key unless --rotate-data-key is given",
+		},
+		cli.BoolFlag{
+			Name:  "rotate-data-key",
+			Usage: "with --rotate: also generate a new data encryption key and reencrypt all values with it",
 		},
 		cli.BoolFlag{
 			Name:   "disable-version-check",
@@ -2083,17 +2084,12 @@ func main() {
 			return toExitError(err)
 		}
 
-		// We open the file *after* the operations on the tree have been
-		// executed to avoid truncating it when there's errors
+		// The file is replaced atomically and only after all operations
+		// succeeded, so a failure can never leave a half-written,
+		// undecryptable file behind.
 		if c.Bool("in-place") || isEditMode || isSetMode {
-			file, err := os.Create(fileName)
-			if err != nil {
-				return common.NewExitError(fmt.Sprintf("Could not open in-place file for writing: %s", err), codes.CouldNotWriteOutputFile)
-			}
-			defer file.Close()
-			_, err = file.Write(output)
-			if err != nil {
-				return toExitError(err)
+			if err := common.WriteFileAtomic(fileName, output); err != nil {
+				return common.NewExitError(fmt.Sprintf("Could not write in-place file: %s", err), codes.CouldNotWriteOutputFile)
 			}
 			log.Info("File written successfully")
 			return nil
@@ -2101,12 +2097,10 @@ func main() {
 
 		outputFile := os.Stdout
 		if c.String("output") != "" {
-			file, err := os.Create(c.String("output"))
-			if err != nil {
-				return common.NewExitError(fmt.Sprintf("Could not open output file for writing: %s", err), codes.CouldNotWriteOutputFile)
+			if err := common.WriteFileAtomic(c.String("output"), output); err != nil {
+				return common.NewExitError(fmt.Sprintf("Could not write output file: %s", err), codes.CouldNotWriteOutputFile)
 			}
-			defer file.Close()
-			outputFile = file
+			return nil
 		}
 		_, err = outputFile.Write(output)
 		return toExitError(err)
@@ -2303,6 +2297,7 @@ func getRotateOpts(c *cli.Context, fileName string, inputStore common.Store, out
 		KeyServices:      svcs,
 		DecryptionOrder:  decryptionOrder,
 		IgnoreMAC:        c.Bool("ignore-mac"),
+		RotateDataKey:    c.Bool("rotate-data-key"),
 		AddMasterKeys:    addMasterKeys,
 		RemoveMasterKeys: rmMasterKeys,
 	}, nil

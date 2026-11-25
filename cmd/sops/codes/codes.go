@@ -26,6 +26,7 @@ const (
 	CouldNotRetrieveKey                    int = 128
 	NoEncryptionKeyFound                   int = 111
 	DuplicateDecryptionKeyType             int = 112
+	KeysRotationFailed                     int = 113
 	FileHasNotBeenModified                 int = 200
 	NoEditorFound                          int = 201
 	FailedToCompareVersions                int = 202
