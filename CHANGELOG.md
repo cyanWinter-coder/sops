@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+Improvements:
+
+* Creation rules now support a `path` directory prefix and an `extensions`
+  constraint. Prefix rules take precedence over `path_regex` rules and are
+  selected by most-specific match: the longest matching prefix wins, with
+  declaration order as the stable tie-break. `path_regex` keeps its existing
+  first-match semantics.
+* Invalid `path_regex` values and malformed key references in creation and
+  destination rules are now rejected when the config file is loaded, with the
+  offending rule position (for example `creation_rules[2]`) in the error.
+* Config files are now cached after loading and reloaded atomically when they
+  change; a failed reload never leaves stale rules in effect.
+* A new `sops matchrule <file>` subcommand reports the creation rule and key
+  groups selected for a file, and fails with a non-zero exit code when no
+  rule matches.
+
 ## 3.13.3
 
 Improvements:

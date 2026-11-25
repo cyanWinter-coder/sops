@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -127,6 +126,19 @@ type configFile struct {
 	CreationRules    []creationRule    `yaml:"creation_rules"`
 	DestinationRules []destinationRule `yaml:"destination_rules"`
 	Stores           StoresConfig      `yaml:"stores"`
+
+	// compiledRules and compiledDestinationRules are populated by compile()
+	// after unmarshalling and are never serialized back to YAML.
+	compiledRules            []*compiledCreationRule
+	compiledDestinationRules []*compiledDestinationRule
+}
+
+// compiledDestinationRule is a destination rule with its path_regex compiled
+// and recreation rule validated at load time.
+type compiledDestinationRule struct {
+	index int
+	regex *regexp.Regexp
+	rule  *destinationRule
 }
 
 type keyGroup struct {
@@ -177,6 +189,8 @@ type destinationRule struct {
 
 type creationRule struct {
 	PathRegex               string      `yaml:"path_regex"`
+	Path                    string      `yaml:"path"`
+	Extensions              []string    `yaml:"extensions"`
 	KMS                     interface{} `yaml:"kms"` // string or []string
 	AwsProfile              string      `yaml:"aws_profile"`
 	Age                     interface{} `yaml:"age"`     // string or []string
@@ -271,6 +285,46 @@ func (f *configFile) load(bytes []byte) error {
 	err := yaml.Unmarshal(bytes, f)
 	if err != nil {
 		return fmt.Errorf("Could not unmarshal config file: %s", err)
+	}
+	return nil
+}
+
+// compile validates and precompiles every rule after unmarshalling. It must
+// be called before a configFile is used for rule selection, so that invalid
+// regexes or key references fail at load time with the rule position.
+func (f *configFile) compile() error {
+	if f.CreationRules != nil {
+		compiled, err := compileCreationRules(f.CreationRules, nil)
+		if err != nil {
+			return err
+		}
+		f.compiledRules = compiled
+	}
+
+	if len(f.DestinationRules) > 0 {
+		compiled := make([]*compiledDestinationRule, 0, len(f.DestinationRules))
+		var errs []error
+		for i := range f.DestinationRules {
+			r := &f.DestinationRules[i]
+			cr := &compiledDestinationRule{index: i, rule: r}
+			if r.PathRegex != "" {
+				reg, err := regexp.Compile(r.PathRegex)
+				if err != nil {
+					errs = append(errs, fmt.Errorf("destination_rules[%d]: can not compile path_regex %q: %w", i, r.PathRegex, err))
+					continue
+				}
+				cr.regex = reg
+			}
+			if err := validateRuleKeys(&r.RecreationRule, nil); err != nil {
+				errs = append(errs, fmt.Errorf("destination_rules[%d]: recreation_rule: %w", i, err))
+				continue
+			}
+			compiled = append(compiled, cr)
+		}
+		if len(errs) > 0 {
+			return joinErrors(errs)
+		}
+		f.compiledDestinationRules = compiled
 	}
 	return nil
 }
@@ -450,20 +504,6 @@ func getKeyGroupsFromCreationRule(cRule *creationRule, kmsEncryptionContext map[
 	return groups, nil
 }
 
-func loadConfigFile(confPath string) (*configFile, error) {
-	confBytes, err := os.ReadFile(confPath)
-	if err != nil {
-		return nil, fmt.Errorf("could not read config file: %s", err)
-	}
-	conf := &configFile{}
-	conf.Stores = *NewStoresConfig()
-	err = conf.load(confBytes)
-	if err != nil {
-		return nil, fmt.Errorf("error loading config: %s", err)
-	}
-	return conf, nil
-}
-
 func configFromRule(rule *creationRule, kmsEncryptionContext map[string]*string) (*Config, error) {
 	cryptRuleCount := 0
 	if rule.UnencryptedSuffix != "" {
@@ -508,23 +548,23 @@ func configFromRule(rule *creationRule, kmsEncryptionContext map[string]*string)
 }
 
 func parseDestinationRuleForFile(conf *configFile, filePath string, kmsEncryptionContext map[string]*string) (*Config, error) {
-	var rule *creationRule
-	var dRule *destinationRule
+	if conf.compiledDestinationRules == nil && len(conf.DestinationRules) > 0 {
+		// Configs built directly in tests bypass compile(); validate lazily.
+		if err := conf.compile(); err != nil {
+			return nil, err
+		}
+	}
 
-	if len(conf.DestinationRules) > 0 {
-		for _, r := range conf.DestinationRules {
-			if r.PathRegex == "" {
-				dRule = &r
-				rule = &dRule.RecreationRule
-				break
-			}
-			if r.PathRegex != "" {
-				if match, _ := regexp.MatchString(r.PathRegex, filePath); match {
-					dRule = &r
-					rule = &dRule.RecreationRule
-					break
-				}
-			}
+	var dRule *compiledDestinationRule
+
+	for _, r := range conf.compiledDestinationRules {
+		if r.regex == nil {
+			dRule = r
+			break
+		}
+		if r.regex.MatchString(filePath) {
+			dRule = r
+			break
 		}
 	}
 
@@ -532,29 +572,30 @@ func parseDestinationRuleForFile(conf *configFile, filePath string, kmsEncryptio
 		return nil, fmt.Errorf("error loading config: no matching destination found in config")
 	}
 
+	rule := &dRule.rule.RecreationRule
 	var dest publish.Destination
 	destinationCount := 0
-	if dRule.S3Bucket != "" {
+	if dRule.rule.S3Bucket != "" {
 		destinationCount++
 	}
-	if dRule.GCSBucket != "" {
+	if dRule.rule.GCSBucket != "" {
 		destinationCount++
 	}
-	if dRule.VaultPath != "" {
+	if dRule.rule.VaultPath != "" {
 		destinationCount++
 	}
 
 	if destinationCount > 1 {
 		return nil, fmt.Errorf("error loading config: more than one destinations were found in a single destination rule, you can only use one per rule")
 	}
-	if dRule.S3Bucket != "" {
-		dest = publish.NewS3Destination(dRule.S3Bucket, dRule.S3Prefix)
+	if dRule.rule.S3Bucket != "" {
+		dest = publish.NewS3Destination(dRule.rule.S3Bucket, dRule.rule.S3Prefix)
 	}
-	if dRule.GCSBucket != "" {
-		dest = publish.NewGCSDestination(dRule.GCSBucket, dRule.GCSPrefix)
+	if dRule.rule.GCSBucket != "" {
+		dest = publish.NewGCSDestination(dRule.rule.GCSBucket, dRule.rule.GCSPrefix)
 	}
-	if dRule.VaultPath != "" {
-		dest = publish.NewVaultDestination(dRule.VaultAddress, dRule.VaultPath, dRule.VaultKVMountName, dRule.VaultKVVersion)
+	if dRule.rule.VaultPath != "" {
+		dest = publish.NewVaultDestination(dRule.rule.VaultAddress, dRule.rule.VaultPath, dRule.rule.VaultKVMountName, dRule.rule.VaultKVVersion)
 	}
 
 	config, err := configFromRule(rule, kmsEncryptionContext)
@@ -562,47 +603,35 @@ func parseDestinationRuleForFile(conf *configFile, filePath string, kmsEncryptio
 		return nil, err
 	}
 	config.Destination = dest
-	config.OmitExtensions = dRule.OmitExtensions
+	config.OmitExtensions = dRule.rule.OmitExtensions
 
 	return config, nil
 }
 
 func parseCreationRuleForFile(conf *configFile, confPath, filePath string, kmsEncryptionContext map[string]*string) (*Config, error) {
-	// If config file doesn't contain CreationRules (it's empty or only contains DestionationRules), assume it does not exist
+	// If config file doesn't contain CreationRules (it's empty or only contains DestinationRules), assume it does not exist
 	if conf.CreationRules == nil {
 		return nil, nil
 	}
 
-	configDir, err := filepath.Abs(filepath.Dir(confPath))
+	if conf.compiledRules == nil {
+		// Configs built directly in tests bypass compile(); validate lazily.
+		if err := conf.compile(); err != nil {
+			return nil, err
+		}
+	}
+
+	rel, err := relativeFilePath(confPath, filePath)
 	if err != nil {
 		return nil, err
 	}
 
-	// compare file path relative to path of config file
-	filePath = strings.TrimPrefix(filePath, configDir+string(filepath.Separator))
-
-	var rule *creationRule
-
-	for _, r := range conf.CreationRules {
-		if r.PathRegex == "" {
-			rule = &r
-			break
-		}
-		reg, err := regexp.Compile(r.PathRegex)
-		if err != nil {
-			return nil, fmt.Errorf("can not compile regexp: %w", err)
-		}
-		if reg.MatchString(filePath) {
-			rule = &r
-			break
-		}
+	matched, err := matchCreationRule(conf.compiledRules, rel)
+	if err != nil {
+		return nil, err
 	}
 
-	if rule == nil {
-		return nil, fmt.Errorf("error loading config: no matching creation rules found")
-	}
-
-	config, err := configFromRule(rule, kmsEncryptionContext)
+	config, err := configFromRule(&matched.rule, kmsEncryptionContext)
 	if err != nil {
 		return nil, err
 	}
@@ -613,29 +642,31 @@ func parseCreationRuleForFile(conf *configFile, confPath, filePath string, kmsEn
 // LoadCreationRuleForFile load the configuration for a given SOPS file from the config file at confPath. A kmsEncryptionContext
 // should be provided for configurations that do not contain key groups, as there's no way to specify context inside
 // a SOPS config file outside of key groups.
+//
+// Loaded config files are cached and revalidated on change; see LoadConfig.
 func LoadCreationRuleForFile(confPath string, filePath string, kmsEncryptionContext map[string]*string) (*Config, error) {
-	conf, err := loadConfigFile(confPath)
+	loaded, err := LoadConfig(confPath)
 	if err != nil {
 		return nil, err
 	}
 
-	return parseCreationRuleForFile(conf, confPath, filePath, kmsEncryptionContext)
+	return loaded.ConfigForFile(filePath, kmsEncryptionContext)
 }
 
 // LoadDestinationRuleForFile works the same as LoadCreationRuleForFile, but gets the "creation_rule" from the matching destination_rule's
 // "recreation_rule".
 func LoadDestinationRuleForFile(confPath string, filePath string, kmsEncryptionContext map[string]*string) (*Config, error) {
-	conf, err := loadConfigFile(confPath)
+	loaded, err := LoadConfig(confPath)
 	if err != nil {
 		return nil, err
 	}
-	return parseDestinationRuleForFile(conf, filePath, kmsEncryptionContext)
+	return parseDestinationRuleForFile(loaded.conf, filePath, kmsEncryptionContext)
 }
 
 func LoadStoresConfig(confPath string) (*StoresConfig, error) {
-	conf, err := loadConfigFile(confPath)
+	loaded, err := LoadConfig(confPath)
 	if err != nil {
 		return nil, err
 	}
-	return &conf.Stores, nil
+	return &loaded.conf.Stores, nil
 }

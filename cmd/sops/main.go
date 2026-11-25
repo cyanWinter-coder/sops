@@ -551,6 +551,30 @@ func main() {
 			},
 		},
 		{
+			Name:      "matchrule",
+			Usage:     "show the creation rule and key groups that apply to a file",
+			ArgsUsage: `file`,
+			Action: func(c *cli.Context) error {
+				if c.NArg() < 1 {
+					return common.NewExitError("Error: no file specified", codes.NoFileSpecified)
+				}
+
+				result, err := matchRuleForCLI(c, c.Args()[0])
+				if err != nil {
+					return toExitError(err)
+				}
+
+				json, err := encodingjson.Marshal(result)
+				if err != nil {
+					return common.NewExitError(err, codes.ErrorGeneric)
+				}
+
+				fmt.Println(string(json))
+
+				return nil
+			},
+		},
+		{
 			Name:  "groups",
 			Usage: "modify the groups on a SOPS file",
 			Subcommands: []cli.Command{
@@ -2522,6 +2546,70 @@ func keyGroups(c *cli.Context, file string, optionalConfig *config.Config) ([]so
 	group = append(group, ageMasterKeys...)
 	log.Debugf("Master keys available:  %+v", group)
 	return []sops.KeyGroup{group}, nil
+}
+
+// matchRuleResult is the JSON output of `sops matchrule`.
+type matchRuleResult struct {
+	ConfigPath string     `json:"config_path"`
+	File       string     `json:"file"`
+	RuleIndex  int        `json:"rule_index"`
+	Path       string     `json:"path,omitempty"`
+	PathRegex  string     `json:"path_regex,omitempty"`
+	Extensions []string   `json:"extensions,omitempty"`
+	KeyGroups  [][]string `json:"key_groups"`
+}
+
+// matchRuleForCLI resolves the creation rule that applies to file, including
+// the master key references the rule selects. A missing config file or the
+// absence of a matching rule is reported as an error so the command can be
+// used as a CI gate.
+func matchRuleForCLI(c *cli.Context, file string) (matchRuleResult, error) {
+	configPath := c.GlobalString("config")
+	if configPath == "" {
+		foundPath, err := findConfigFile()
+		if err != nil {
+			return matchRuleResult{}, common.NewExitError(
+				fmt.Sprintf("Error: could not find config file: %s", err), codes.ConfigFileNotFound)
+		}
+		configPath = foundPath
+	}
+
+	loaded, err := config.LoadConfig(configPath)
+	if err != nil {
+		return matchRuleResult{}, common.NewExitError(
+			fmt.Sprintf("Error: could not load config file %q: %s", configPath, err), codes.ErrorReadingConfig)
+	}
+
+	match, err := loaded.MatchRule(file)
+	if err != nil {
+		return matchRuleResult{}, common.NewExitError(
+			fmt.Sprintf("Error: %s", err), codes.ErrorReadingConfig)
+	}
+
+	conf, err := loaded.ConfigForFile(file, nil)
+	if err != nil {
+		return matchRuleResult{}, common.NewExitError(
+			fmt.Sprintf("Error: could not build key groups for %q: %s", file, err), codes.ErrorReadingConfig)
+	}
+
+	keyGroups := make([][]string, 0, len(conf.KeyGroups))
+	for _, group := range conf.KeyGroups {
+		ids := make([]string, 0, len(group))
+		for _, key := range group {
+			ids = append(ids, key.ToString())
+		}
+		keyGroups = append(keyGroups, ids)
+	}
+
+	return matchRuleResult{
+		ConfigPath: loaded.Path(),
+		File:       file,
+		RuleIndex:  match.Index,
+		Path:       match.Path,
+		PathRegex:  match.PathRegex,
+		Extensions: match.Extensions,
+		KeyGroups:  keyGroups,
+	}, nil
 }
 
 // loadConfig will look for an existing config file, either provided through the command line, or using findConfigFile

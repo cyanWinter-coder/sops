@@ -584,7 +584,7 @@ func TestLoadConfigFileWithNoMatchingRules(t *testing.T) {
 
 func TestLoadConfigFileWithInvalidComplicatedRegexp(t *testing.T) {
 	conf, err := parseCreationRuleForFile(parseConfigFile(sampleConfigWithInvalidComplicatedRegexp, t), "/conf/path", "stage/prod/api.yml", nil)
-	assert.Equal(t, "can not compile regexp: error parsing regexp: invalid escape sequence: `\\K`", err.Error())
+	assert.Equal(t, "error loading config: creation_rules[0]: can not compile path_regex \"[ ]\\\\K(?<!\\\\d )(?=\": error parsing regexp: invalid escape sequence: `\\K`", err.Error())
 	assert.Nil(t, conf)
 }
 
