@@ -103,9 +103,12 @@ func (store Store) nodeToTreeValue(node *yaml.Node, commentsWereHandled bool) (i
 		branch := make(sops.TreeBranch, 0)
 		return store.appendYamlNodeToTreeBranch(node, branch, commentsWereHandled)
 	case yaml.ScalarNode:
-		var result interface{}
-		node.Decode(&result)
-		return result, nil
+		// Decode to the traditional plain Go value when its representation
+		// round-trips losslessly; otherwise retain the scalar's tag,
+		// literal and style in a Scalar wrapper so the emitted document
+		// preserves integer/float spelling, quoting, timestamps and the
+		// !!binary tag instead of normalizing them.
+		return decodeYamlScalar(node)
 	case yaml.AliasNode:
 		return store.nodeToTreeValue(node.Alias, false)
 	}
@@ -216,6 +219,8 @@ func (store *Store) addCommentsLine(node *yaml.Node, comments []string) []string
 
 func (store *Store) treeValueToNode(in interface{}) *yaml.Node {
 	switch in := in.(type) {
+	case sops.Scalar:
+		return scalarNode(in)
 	case sops.TreeBranch:
 		var mapping = &yaml.Node{}
 		mapping.Kind = yaml.MappingNode
@@ -312,10 +317,16 @@ func (store *Store) LoadEncryptedFile(in []byte) (sops.Tree, error) {
 	if err != nil {
 		return sops.Tree{}, err
 	}
-	return sops.Tree{
+	// Re-attach the scalar representations captured during encryption so
+	// that decrypting and re-emitting restores the original spelling.
+	stores.RestoreRepresentations(branches, metadata.Representations())
+	tree := sops.Tree{
 		Branches: branches,
 		Metadata: metadata,
-	}, nil
+	}
+	// Ensure decrypted scalars regain their original YAML representation.
+	tree.SetScalarRewrapper(rewrapScalar)
+	return tree, nil
 }
 
 // LoadPlainFile loads the contents of a plaintext yaml file onto a
@@ -325,7 +336,10 @@ func (store *Store) LoadPlainFile(in []byte) (sops.TreeBranches, error) {
 	if len(in) > 0 {
 		// This is needed to make the yaml-decoder check for uniqueness of keys
 		// Can probably be removed when https://github.com/go-yaml/yaml/issues/814 is merged.
-		if err := yaml.NewDecoder(bytes.NewReader(in)).Decode(make(map[string]interface{})); err != nil {
+		// The check runs on the node tree rather than a map[string]interface{}
+		// so that representation-preserving scalars such as !!binary do not
+		// force an extra, lossy generic decode.
+		if err := checkDuplicateKeys(in); err != nil {
 			return nil, err
 		}
 	}
@@ -349,6 +363,48 @@ func (store *Store) LoadPlainFile(in []byte) (sops.TreeBranches, error) {
 	return branches, nil
 }
 
+// checkDuplicateKeys walks every YAML document in the input and returns an
+// error describing the first mapping that declares the same key more than
+// once. Duplicate keys are invalid YAML and would otherwise be accepted.
+func checkDuplicateKeys(in []byte) error {
+	d := yaml.NewDecoder(bytes.NewReader(in))
+	for {
+		var node yaml.Node
+		err := d.Decode(&node)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := nodeCheckDuplicateKeys(&node, map[string]int{}); err != nil {
+			return err
+		}
+	}
+}
+
+func nodeCheckDuplicateKeys(node *yaml.Node, seen map[string]int) error {
+	if node.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key := node.Content[i]
+			if firstLine, ok := seen[key.Value]; ok {
+				return fmt.Errorf("yaml: unmarshal errors:\n  line %d: mapping key %q already defined at line %d", key.Line, key.Value, firstLine)
+			}
+			seen[key.Value] = key.Line
+			if err := nodeCheckDuplicateKeys(node.Content[i+1], map[string]int{}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, child := range node.Content {
+		if err := nodeCheckDuplicateKeys(child, map[string]int{}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (store *Store) getIndentation() (int, error) {
 	if store.config.Indent > 0 {
 		return store.config.Indent, nil
@@ -361,6 +417,9 @@ func (store *Store) getIndentation() (int, error) {
 // EmitEncryptedFile returns the encrypted bytes of the yaml file corresponding to a
 // sops.Tree runtime object
 func (store *Store) EmitEncryptedFile(in sops.Tree) ([]byte, error) {
+	// Scalar representations are captured by Tree.Encrypt before values
+	// become ENC[...] strings and ride along on the metadata; the reserved
+	// scalar_representations entry is emitted from there.
 	branches, err := stores.SerializeMetadata(in, stores.MetadataOpts{
 		Flatten: stores.MetadataFlattenNone,
 	})

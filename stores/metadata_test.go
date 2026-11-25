@@ -15,6 +15,14 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// withoutRawMetadata clears the internal raw-metadata snapshot so two
+// Metadata values can be compared on their typed fields. The snapshot is
+// representation state owned by the stores, not part of the typed contract.
+func withoutRawMetadata(m sops.Metadata) sops.Metadata {
+	m.SetRawMetadata(nil)
+	return m
+}
+
 func TestExtractMetadata(t *testing.T) {
 	var (
 		broken1 = sops.TreeBranch{
@@ -746,25 +754,25 @@ func TestExtractMetadata(t *testing.T) {
 	assert.NotNil(t, err)
 	assert.Equal(t, sops.MetadataNotFound, err)
 	assert.Nil(t, branches)
-	assert.Equal(t, sops.Metadata{}, metadata)
+	assert.Equal(t, sops.Metadata{}, withoutRawMetadata(metadata))
 
 	branches, metadata, err = ExtractMetadata([]sops.TreeBranch{broken2}, MetadataOpts{Flatten: MetadataFlattenNone})
 	assert.NotNil(t, err)
 	assert.Equal(t, "Found sops entry that is not a mapping", err.Error())
 	assert.Nil(t, branches)
-	assert.Equal(t, sops.Metadata{}, metadata)
+	assert.Equal(t, sops.Metadata{}, withoutRawMetadata(metadata))
 
 	branches, metadata, err = ExtractMetadata([]sops.TreeBranch{empty}, MetadataOpts{Flatten: MetadataFlattenNone})
 	assert.NotNil(t, err)
 	assert.Equal(t, "parsing time \"\" as \"2006-01-02T15:04:05Z07:00\": cannot parse \"\" as \"2006\"", err.Error())
 	assert.Nil(t, branches)
-	assert.Equal(t, sops.Metadata{}, metadata)
+	assert.Equal(t, sops.Metadata{}, withoutRawMetadata(metadata))
 
 	branches, metadata, err = ExtractMetadata([]sops.TreeBranch{minimal1}, MetadataOpts{Flatten: MetadataFlattenNone})
 	assert.NotNil(t, err)
 	assert.Equal(t, "No keys found in file", err.Error())
 	assert.Nil(t, branches)
-	assert.Equal(t, sops.Metadata{}, metadata)
+	assert.Equal(t, sops.Metadata{}, withoutRawMetadata(metadata))
 
 	branches, metadata, err = ExtractMetadata([]sops.TreeBranch{minimal2}, MetadataOpts{Flatten: MetadataFlattenNone})
 	assert.Nil(t, err)
@@ -780,13 +788,13 @@ func TestExtractMetadata(t *testing.T) {
 				},
 			},
 		},
-	}, metadata)
+	}, withoutRawMetadata(metadata))
 
 	branches, metadata, err = ExtractMetadata([]sops.TreeBranch{multiple}, MetadataOpts{Flatten: MetadataFlattenNone})
 	assert.NotNil(t, err)
 	assert.Equal(t, "Cannot use more than one of encrypted_suffix, unencrypted_suffix, encrypted_regex, unencrypted_regex, encrypted_comment_regex, or unencrypted_comment_regex in the same file", err.Error())
 	assert.Nil(t, branches)
-	assert.Equal(t, sops.Metadata{}, metadata)
+	assert.Equal(t, sops.Metadata{}, withoutRawMetadata(metadata))
 
 	branches, metadata, err = ExtractMetadata([]sops.TreeBranch{single1}, MetadataOpts{Flatten: MetadataFlattenNone})
 	assert.Nil(t, err)
@@ -802,7 +810,7 @@ func TestExtractMetadata(t *testing.T) {
 				},
 			},
 		},
-	}, metadata)
+	}, withoutRawMetadata(metadata))
 
 	branches, metadata, err = ExtractMetadata([]sops.TreeBranch{single2}, MetadataOpts{Flatten: MetadataFlattenNone})
 	assert.Nil(t, err)
@@ -818,7 +826,7 @@ func TestExtractMetadata(t *testing.T) {
 				},
 			},
 		},
-	}, metadata)
+	}, withoutRawMetadata(metadata))
 
 	branches, metadata, err = ExtractMetadata([]sops.TreeBranch{single3}, MetadataOpts{Flatten: MetadataFlattenNone})
 	assert.Nil(t, err)
@@ -834,7 +842,7 @@ func TestExtractMetadata(t *testing.T) {
 				},
 			},
 		},
-	}, metadata)
+	}, withoutRawMetadata(metadata))
 
 	branches, metadata, err = ExtractMetadata([]sops.TreeBranch{single4}, MetadataOpts{Flatten: MetadataFlattenNone})
 	assert.Nil(t, err)
@@ -850,7 +858,7 @@ func TestExtractMetadata(t *testing.T) {
 				},
 			},
 		},
-	}, metadata)
+	}, withoutRawMetadata(metadata))
 
 	branches, metadata, err = ExtractMetadata([]sops.TreeBranch{single5}, MetadataOpts{Flatten: MetadataFlattenNone})
 	assert.Nil(t, err)
@@ -866,7 +874,7 @@ func TestExtractMetadata(t *testing.T) {
 				},
 			},
 		},
-	}, metadata)
+	}, withoutRawMetadata(metadata))
 
 	branches, metadata, err = ExtractMetadata([]sops.TreeBranch{single6}, MetadataOpts{Flatten: MetadataFlattenNone})
 	assert.Nil(t, err)
@@ -882,7 +890,7 @@ func TestExtractMetadata(t *testing.T) {
 				},
 			},
 		},
-	}, metadata)
+	}, withoutRawMetadata(metadata))
 
 	branches, metadata, err = ExtractMetadata([]sops.TreeBranch{everything1}, MetadataOpts{Flatten: MetadataFlattenNone})
 	assert.Nil(t, err)
@@ -943,7 +951,7 @@ func TestExtractMetadata(t *testing.T) {
 				},
 			},
 		},
-	}, metadata)
+	}, withoutRawMetadata(metadata))
 
 	branches, metadata, err = ExtractMetadata([]sops.TreeBranch{everything2}, MetadataOpts{Flatten: MetadataFlattenNone})
 	assert.Nil(t, err)
@@ -1003,7 +1011,7 @@ func TestExtractMetadata(t *testing.T) {
 				},
 			},
 		},
-	}, metadata)
+	}, withoutRawMetadata(metadata))
 }
 
 func TestSerializeMetadata(t *testing.T) {

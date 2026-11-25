@@ -124,8 +124,27 @@ func (c Cipher) Decrypt(ciphertext string, key []byte, additionalData string) (p
 	return plaintext, err
 }
 
+// unwrapForCipher returns the value a Scalar or RawNumber wraps, leaving
+// any other value untouched. It keeps the cipher's type switch focused on
+// the underlying Go types while representation metadata stays on the
+// wrapper.
+func unwrapForCipher(value interface{}) interface{} {
+	if scalar, ok := value.(sops.Scalar); ok {
+		return scalar.Value
+	}
+	if number, ok := value.(sops.RawNumber); ok {
+		return number.Value
+	}
+	return value
+}
+
 func isEmpty(value interface{}) bool {
+	// A Scalar or RawNumber is empty exactly when its underlying value is.
 	switch value := value.(type) {
+	case sops.Scalar:
+		return isEmpty(value.Value)
+	case sops.RawNumber:
+		return isEmpty(value.Value)
 	case string:
 		return value == ""
 	case []byte:
@@ -147,7 +166,11 @@ func (c Cipher) Encrypt(plaintext interface{}, key []byte, additionalData string
 		return "", fmt.Errorf("Could not initialize AES GCM encryption cipher: %s", err)
 	}
 	var iv []byte
-	if stash, ok := c.stash[stashKey{plaintext: plaintext, additionalData: additionalData}]; !ok {
+	// The stash is keyed on the underlying value: a Scalar and the plain
+	// value it wraps must reuse the same IV, otherwise re-encrypting a
+	// decrypted file would change the ciphertext of untouched values.
+	stashPlaintext := unwrapForCipher(plaintext)
+	if stash, ok := c.stash[stashKey{plaintext: stashPlaintext, additionalData: additionalData}]; !ok {
 		iv = make([]byte, nonceSize)
 		_, err = rand.Read(iv)
 		if err != nil {
@@ -162,7 +185,7 @@ func (c Cipher) Encrypt(plaintext interface{}, key []byte, additionalData string
 	}
 	var plainBytes []byte
 	var encryptedType string
-	switch value := plaintext.(type) {
+	switch value := unwrapForCipher(plaintext).(type) {
 	case string:
 		encryptedType = "str"
 		plainBytes = []byte(value)
@@ -187,6 +210,11 @@ func (c Cipher) Encrypt(plaintext interface{}, key []byte, additionalData string
 		if err != nil {
 			return "", fmt.Errorf("Error marshaling timestamp %q: %w", value, err)
 		}
+	case []byte:
+		// Binary scalars (e.g. YAML's !!binary) are encrypted as bytes so
+		// that decryption yields a []byte again instead of a string.
+		encryptedType = "bytes"
+		plainBytes = value
 	case sops.Comment:
 		encryptedType = "comment"
 		plainBytes = []byte(value.Value)

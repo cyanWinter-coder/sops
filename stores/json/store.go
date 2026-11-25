@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 
 	"github.com/getsops/sops/v3"
@@ -134,21 +135,38 @@ func (store Store) sliceFromJSONDecoder(dec *json.Decoder) ([]interface{}, error
 
 // normalizeJSONNumber converts a json.Number scalar (produced because the
 // decoder runs with UseNumber) into an int for integers within the int64 range
-// and a float64 otherwise. Non-number tokens are returned unchanged; a number
-// representable as neither returns the json.Number.Float64 error.
+// and a float64 otherwise. When the literal spelling would not round-trip
+// losslessly through that Go value (e.g. `1.0`, scientific notation, or an
+// integer outside the int64 range), the value is returned as a sops.RawNumber
+// that also keeps the original literal, so emission can reproduce the document
+// byte-for-byte instead of normalizing it. Non-number tokens are returned
+// unchanged; a number representable as neither returns the json.Number.Float64
+// error.
 func normalizeJSONNumber(t interface{}) (interface{}, error) {
 	n, ok := t.(json.Number)
 	if !ok {
 		return t, nil
 	}
+	literal := n.String()
 	if i, err := n.Int64(); err == nil {
-		return int(i), nil
+		value := int(i)
+		// Integers re-emit canonically as plain decimal digits when they
+		// survive the platform conversion; anything else keeps its literal.
+		if int64(value) == i && strconv.Itoa(value) == literal {
+			return value, nil
+		}
+		return sops.RawNumber{Value: value, Literal: literal}, nil
 	}
 	f, err := n.Float64()
 	if err != nil {
 		return nil, err
 	}
-	return f, nil
+	// Keep the literal whenever the float64 spells differently (1.0,
+	// 1e3, 1.000, ...); canonical floats stay bare float64 values.
+	if strconv.FormatFloat(f, 'f', -1, 64) == literal {
+		return f, nil
+	}
+	return sops.RawNumber{Value: f, Literal: literal}, nil
 }
 
 var errEndOfObject = fmt.Errorf("End of object")
@@ -219,6 +237,17 @@ func (store Store) encodeValue(v interface{}) ([]byte, error) {
 		return store.encodeTree(v)
 	case []interface{}:
 		return store.encodeArray(v)
+	case sops.RawNumber:
+		// Encryption replaces the wrapped number with an ENC[...] string
+		// while keeping the RawNumber shell. Emit that as a normal JSON
+		// string; an unencrypted number is reproduced verbatim from its
+		// original literal.
+		if text, ok := v.Value.(string); ok && strings.HasPrefix(text, "ENC[") {
+			return json.Marshal(text)
+		}
+		// Emit the original numeric literal verbatim. It is validated as
+		// a JSON number at load time, so it needs no escaping here.
+		return []byte(v.Literal), nil
 	default:
 		return json.Marshal(v)
 	}
@@ -313,6 +342,16 @@ func (store Store) reindentJSON(in []byte) ([]byte, error) {
 	return out.Bytes(), err
 }
 
+// rewrapScalar restores a JSON RawNumber's shell after its ciphertext has
+// been decrypted back into a number. The original literal is retained on
+// the wrapper, so the number is re-emitted with its original spelling.
+func rewrapScalar(in interface{}) interface{} {
+	if number, ok := in.(sops.RawNumber); ok {
+		return number
+	}
+	return nil
+}
+
 // LoadEncryptedFile loads an encrypted secrets file onto a sops.Tree object
 func (store *Store) LoadEncryptedFile(in []byte) (sops.Tree, error) {
 	branches, err := store.LoadPlainFile(in)
@@ -325,10 +364,15 @@ func (store *Store) LoadEncryptedFile(in []byte) (sops.Tree, error) {
 	if err != nil {
 		return sops.Tree{}, err
 	}
-	return sops.Tree{
+	// Re-attach numeric representations captured during encryption (e.g.
+	// `1.0` or integers outside the int64 range).
+	stores.RestoreRepresentations(branches, metadata.Representations())
+	tree := sops.Tree{
 		Branches: branches,
 		Metadata: metadata,
-	}, nil
+	}
+	tree.SetScalarRewrapper(rewrapScalar)
+	return tree, nil
 }
 
 // LoadPlainFile loads plaintext json file bytes onto a sops.TreeBranches object
@@ -345,6 +389,8 @@ func (store *Store) LoadPlainFile(in []byte) (sops.TreeBranches, error) {
 // EmitEncryptedFile returns the encrypted bytes of the json file corresponding to a
 // sops.Tree runtime object
 func (store *Store) EmitEncryptedFile(in sops.Tree) ([]byte, error) {
+	// Numeric representations are captured by Tree.Encrypt and ride along
+	// on the metadata as the reserved scalar_representations entry.
 	branches, err := stores.SerializeMetadata(in, stores.MetadataOpts{
 		Flatten: stores.MetadataFlattenNone,
 	})

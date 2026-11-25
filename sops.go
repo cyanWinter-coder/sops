@@ -303,6 +303,18 @@ type Tree struct {
 	Branches TreeBranches
 	// FilePath is the path of the file this struct represents
 	FilePath string
+	// scalarRewrapper, when set, rebuilds representation-preserving
+	// scalar wrappers (Scalar/RawNumber) after a value is decrypted.
+	// Stores that preserve source representation set it; it is unused
+	// during encryption.
+	scalarRewrapper ScalarRewrapper
+}
+
+// SetScalarRewrapper attaches a rewrapper used during decryption to restore
+// store-specific scalar representation. It is part of the store integration
+// surface, not of the generic tree contract.
+func (tree *Tree) SetScalarRewrapper(rewrap ScalarRewrapper) {
+	tree.scalarRewrapper = rewrap
 }
 
 // Truncate truncates the tree to the path specified
@@ -336,7 +348,78 @@ func (branch TreeBranch) Truncate(path []interface{}) (interface{}, error) {
 	return current, nil
 }
 
-func (branch TreeBranch) walkValue(in interface{}, path []string, commentsStack [][]string, onLeaves func(in interface{}, path []string, commentsStack [][]string) (interface{}, error)) (interface{}, error) {
+// joinWalkPath renders a walk path (a list of map keys) into a human
+// readable location such as `a.b[0].c`. It is used to annotate errors with
+// the document location that failed to encrypt or decrypt.
+func joinWalkPath(path []string) string {
+	if len(path) == 0 {
+		return "<root>"
+	}
+	var b strings.Builder
+	for i, component := range path {
+		if i > 0 {
+			b.WriteString(".")
+		}
+		b.WriteString(component)
+	}
+	return b.String()
+}
+
+// isEncryptedText reports whether a value is an encrypted scalar as
+// produced by the AES cipher. It lets the walker distinguish an encryption
+// pass (plaintext in, ciphertext out) from a decryption pass (ciphertext
+// in, plaintext out).
+func isEncryptedText(in interface{}) bool {
+	text, ok := in.(string)
+	return ok && strings.HasPrefix(text, "ENC[")
+}
+
+// ScalarRewrapper rebuilds representation-preserving wrappers after a
+// decryption pass. Stores attach one to a Tree so that values such as
+// `1.0` or a YAML !!binary node keep their original tag and literal once
+// their ciphertext has been decrypted back to a plain Go value. It
+// receives the wrapper whose Value is the freshly decrypted plaintext and
+// returns the wrapper (or a replacement) to keep in the tree. Returning
+// nil leaves the wrapper unchanged.
+type ScalarRewrapper func(in interface{}) interface{}
+
+func (branch TreeBranch) walkValue(in interface{}, path []string, commentsStack [][]string, onLeaves func(in interface{}, path []string, commentsStack [][]string) (interface{}, error), rewrap ScalarRewrapper) (interface{}, error) {
+	// A Scalar behaves exactly like the value it wraps for walking,
+	// encryption and MAC purposes. The representation metadata is carried
+	// through untouched by re-wrapping the result.
+	if scalar, ok := in.(Scalar); ok {
+		wasEncrypted := isEncryptedText(scalar.Value)
+		out, err := branch.walkValue(scalar.Value, path, commentsStack, onLeaves, rewrap)
+		if err != nil {
+			return nil, err
+		}
+		scalar.Value = out
+		// A decryption pass turns the wrapped ENC[...] string back into a
+		// plaintext Go value; let the owning store rebuild any
+		// representation it needs for lossless re-emission.
+		if wasEncrypted && !isEncryptedText(scalar.Value) && rewrap != nil {
+			if wrapped := rewrap(scalar); wrapped != nil {
+				return wrapped, nil
+			}
+		}
+		return scalar, nil
+	}
+	// A RawNumber is likewise transparent: walk the decoded number and
+	// keep the original literal for lossless re-emission.
+	if number, ok := in.(RawNumber); ok {
+		wasEncrypted := isEncryptedText(number.Value)
+		out, err := branch.walkValue(number.Value, path, commentsStack, onLeaves, rewrap)
+		if err != nil {
+			return nil, err
+		}
+		number.Value = out
+		if wasEncrypted && !isEncryptedText(number.Value) && rewrap != nil {
+			if wrapped := rewrap(number); wrapped != nil {
+				return wrapped, nil
+			}
+		}
+		return number, nil
+	}
 	switch in := in.(type) {
 	case string:
 		return onLeaves(in, path, commentsStack)
@@ -353,9 +436,9 @@ func (branch TreeBranch) walkValue(in interface{}, path []string, commentsStack 
 	case Comment:
 		return onLeaves(in, path, commentsStack)
 	case TreeBranch:
-		return branch.walkBranch(in, path, commentsStack, onLeaves)
+		return branch.walkBranch(in, path, commentsStack, onLeaves, rewrap)
 	case []interface{}:
-		return branch.walkSlice(in, path, commentsStack, onLeaves)
+		return branch.walkSlice(in, path, commentsStack, onLeaves, rewrap)
 	case nil:
 		// the value returned remains the same since it doesn't make
 		// sense to encrypt or decrypt a nil value
@@ -365,7 +448,7 @@ func (branch TreeBranch) walkValue(in interface{}, path []string, commentsStack 
 	}
 }
 
-func (branch TreeBranch) walkSlice(in []interface{}, path []string, commentsStack [][]string, onLeaves func(in interface{}, path []string, commentsStack [][]string) (interface{}, error)) ([]interface{}, error) {
+func (branch TreeBranch) walkSlice(in []interface{}, path []string, commentsStack [][]string, onLeaves func(in interface{}, path []string, commentsStack [][]string) (interface{}, error), rewrap ScalarRewrapper) ([]interface{}, error) {
 	// Because append returns a new slice, the original stack is not changed.
 	commentsStack = append(commentsStack, []string{})
 	for i, v := range in {
@@ -375,9 +458,9 @@ func (branch TreeBranch) walkSlice(in []interface{}, path []string, commentsStac
 			// This allows us to also encrypt comments themselves by enabling encryption in a prior comment.
 			commentsStack[len(commentsStack)-1] = append(commentsStack[len(commentsStack)-1], c.Value)
 		}
-		newV, err := branch.walkValue(v, path, commentsStack, onLeaves)
+		newV, err := branch.walkValue(v, path, commentsStack, onLeaves, rewrap)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("error at %s[%d]: %w", joinWalkPath(path), i, err)
 		}
 		in[i] = newV
 		// When encrypting comments in a slice, the Comment is converted to a non-Comment.
@@ -396,7 +479,7 @@ func (branch TreeBranch) walkSlice(in []interface{}, path []string, commentsStac
 	return in, nil
 }
 
-func (branch TreeBranch) walkBranch(in TreeBranch, path []string, commentsStack [][]string, onLeaves func(in interface{}, path []string, commentsStack [][]string) (interface{}, error)) (TreeBranch, error) {
+func (branch TreeBranch) walkBranch(in TreeBranch, path []string, commentsStack [][]string, onLeaves func(in interface{}, path []string, commentsStack [][]string) (interface{}, error), rewrap ScalarRewrapper) (TreeBranch, error) {
 	// Because append returns a new slice, the original stack is not changed.
 	commentsStack = append(commentsStack, []string{})
 	for i, item := range in {
@@ -404,7 +487,7 @@ func (branch TreeBranch) walkBranch(in TreeBranch, path []string, commentsStack 
 			// If key is a comment, we add it to the slice of active comments.
 			// This allows us to also encrypt comments themselves by enabling encryption in a prior comment.
 			commentsStack[len(commentsStack)-1] = append(commentsStack[len(commentsStack)-1], c.Value)
-			enc, err := branch.walkValue(item.Key, path, commentsStack, onLeaves)
+			enc, err := branch.walkValue(item.Key, path, commentsStack, onLeaves, rewrap)
 			if err != nil {
 				return nil, err
 			}
@@ -429,9 +512,9 @@ func (branch TreeBranch) walkBranch(in TreeBranch, path []string, commentsStack 
 			return nil, fmt.Errorf(
 				"Tree contains a non-string key (type %T): %s. Only string keys are supported", item.Key, item.Key)
 		}
-		newV, err := branch.walkValue(item.Value, append(path, key), commentsStack, onLeaves)
+		newV, err := branch.walkValue(item.Value, append(path, key), commentsStack, onLeaves, rewrap)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("error at %s: %w", joinWalkPath(append(path, key)), err)
 		}
 		in[i].Value = newV
 		if !valueIsComment {
@@ -528,10 +611,15 @@ func (tree Tree) shouldBeEncrypted(path []string, commentsStack [][]string, isCo
 // If encryption is successful, it returns the MAC for the encrypted tree
 // (all values if MACOnlyEncrypted is false, or only over values which end
 // up encrypted if MACOnlyEncrypted is true).
-func (tree Tree) Encrypt(key []byte, cipher Cipher) (string, error) {
+func (tree *Tree) Encrypt(key []byte, cipher Cipher) (string, error) {
 	audit.SubmitEvent(audit.EncryptEvent{
 		File: tree.FilePath,
 	})
+	// Capture scalar representations before encryption replaces wrapper
+	// values with ENC[...] strings. The representations are attached to
+	// the metadata so EmitEncryptedFile can persist them for a faithful
+	// later decryption.
+	tree.Metadata.SetRepresentations(collectTreeRepresentations(tree.Branches))
 	hash := sha512.New()
 	if tree.Metadata.MACOnlyEncrypted {
 		// We initialize with known set of bytes so that a MAC with this setting
@@ -571,7 +659,7 @@ func (tree Tree) Encrypt(key []byte, cipher Cipher) (string, error) {
 				}
 			}
 			return in, nil
-		})
+		}, nil)
 		return err
 	}
 
@@ -592,11 +680,20 @@ func (tree Tree) Encrypt(key []byte, cipher Cipher) (string, error) {
 // If decryption is successful, it returns the MAC for the decrypted tree
 // (all values if MACOnlyEncrypted is false, or only over values which end
 // up decrypted if MACOnlyEncrypted is true).
-func (tree Tree) Decrypt(key []byte, cipher Cipher) (string, error) {
+func (tree *Tree) Decrypt(key []byte, cipher Cipher) (string, error) {
 	log.Debug("Decrypting tree")
 	audit.SubmitEvent(audit.DecryptEvent{
 		File: tree.FilePath,
 	})
+	// Decrypt mutates the tree in place on success, as it always has. To
+	// guarantee that a failure never leaves a mixture of encrypted and
+	// decrypted values, a deep copy of the branches is taken before the
+	// walk: on error the original branches are restored, so no partially
+	// decrypted tree is ever observable.
+	backup, ok := DeepCopy(tree.Branches).(TreeBranches)
+	if !ok {
+		return "", fmt.Errorf("Internal error: deep copy of tree branches produced %T", DeepCopy(tree.Branches))
+	}
 	hash := sha512.New()
 	if tree.Metadata.MACOnlyEncrypted {
 		// We initialize with known set of bytes so that a MAC with this setting
@@ -625,7 +722,7 @@ func (tree Tree) Decrypt(key []byte, cipher Cipher) (string, error) {
 				} else if inStr, inIsStr := in.(string); inIsStr {
 					v, err = cipher.Decrypt(inStr, key, pathString)
 					if err != nil {
-						return nil, fmt.Errorf("Could not decrypt value: %s", err)
+						return nil, fmt.Errorf("Could not decrypt value: %w", err)
 					}
 				} else {
 					return nil, fmt.Errorf("Expected encrypted value as string, but got %T", in)
@@ -640,19 +737,22 @@ func (tree Tree) Decrypt(key []byte, cipher Cipher) (string, error) {
 				if _, resultIsComment := v.(Comment); !resultIsComment {
 					bytes, err := ToBytes(v)
 					if err != nil {
-						return nil, fmt.Errorf("Could not convert %s to bytes: %s", in, err)
+						return nil, fmt.Errorf("Could not convert %s to bytes: %w", in, err)
 					}
 					hash.Write(bytes)
 				}
 			}
 			return v, nil
-		})
+		}, tree.scalarRewrapper)
 		return err
 	}
 	for _, branch := range tree.Branches {
 		err := walk(branch)
 		if err != nil {
-			return "", fmt.Errorf("Error walking tree: %s", err)
+			// Restore the untouched branches so no partially decrypted
+			// tree is observable to the caller.
+			tree.Branches = backup
+			return "", fmt.Errorf("Error walking tree: %w", err)
 		}
 	}
 	return fmt.Sprintf("%X", hash.Sum(nil)), nil
@@ -696,6 +796,53 @@ type Metadata struct {
 	ShamirThreshold int
 	// DataKey caches the decrypted data key so it doesn't have to be decrypted with a master key every time it's needed
 	DataKey []byte
+	// rawMetadata preserves the metadata entries exactly as they were read
+	// from the file, including their order and any fields this version of
+	// SOPS does not know about. Stores use it to re-emit the metadata block
+	// losslessly instead of reconstructing and re-sorting it from the typed
+	// fields above. It is nil for metadata created locally (i.e. when
+	// encrypting a previously unencrypted file).
+	rawMetadata TreeBranch
+	// representations remembers how scalar values were spelled in the
+	// source document (tags, literals, quoting) keyed by their tree path.
+	// Encryption replaces them with ENC[...] strings; the stores re-attach
+	// the representation when the encrypted file is loaded again so a
+	// decrypt/re-encrypt round-trip is byte-faithful. It is not serialized
+	// into the file.
+	representations []Representation
+}
+
+// Representation pairs a tree location (map keys as strings, list indices
+// as ints) with the representation-preserving wrapper found there. It is
+// store-facing state carried on Metadata, never written into the document.
+type Representation struct {
+	Path    []interface{}
+	Wrapper interface{}
+}
+
+// SetRepresentations stores the scalar representations captured during
+// encryption. The slice is stored by reference.
+func (m *Metadata) SetRepresentations(representations []Representation) {
+	m.representations = representations
+}
+
+// Representations returns the scalar representations captured during
+// encryption, or nil when none were recorded.
+func (m *Metadata) Representations() []Representation {
+	return m.representations
+}
+
+// SetRawMetadata stores the original, ordered metadata tree. It is intended
+// for stores that want unknown fields and key ordering to survive a
+// decrypt/re-encrypt round-trip. The argument is stored by reference.
+func (m *Metadata) SetRawMetadata(branch TreeBranch) {
+	m.rawMetadata = branch
+}
+
+// RawMetadata returns the metadata tree captured when the file was loaded,
+// or nil when the metadata was created locally rather than read from a file.
+func (m *Metadata) RawMetadata() TreeBranch {
+	return m.rawMetadata
 }
 
 // KeyGroup is a slice of SOPS MasterKeys that all encrypt the same part of the data key
@@ -978,6 +1125,15 @@ func (m Metadata) GetDataKey() ([]byte, error) {
 
 // ToBytes converts a string, int, float or bool to a byte representation.
 func ToBytes(in interface{}) ([]byte, error) {
+	// A Scalar contributes its underlying value to the MAC, so the MAC is
+	// independent of representation details such as quoting or base.
+	if scalar, ok := in.(Scalar); ok {
+		return ToBytes(scalar.Value)
+	}
+	// A RawNumber contributes the decoded numeric value to the MAC.
+	if number, ok := in.(RawNumber); ok {
+		return ToBytes(number.Value)
+	}
 	switch in := in.(type) {
 	case string:
 		return []byte(in), nil
